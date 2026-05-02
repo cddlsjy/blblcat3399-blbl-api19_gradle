@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 19 fallback: plain white circle (vector not supported in layer-list on API < 21) -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#FFFFFFFF" />
+    <size
+        android:width="@dimen/player_seekbar_height"
+        android:height="@dimen/player_seekbar_height" />
+</shape>

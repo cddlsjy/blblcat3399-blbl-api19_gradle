@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <View
+        android:id="@+id/touch_gesture_layer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent"
+        android:clickable="true"
+        android:focusable="false"
+        android:importantForAccessibility="no" />
+
+    <ImageButton
+        android:id="@+id/btn_touch_lock"
+        android:layout_width="@dimen/player_touch_lock_button_size"
+        android:layout_height="@dimen/player_touch_lock_button_size"
+        android:layout_gravity="start|center_vertical"
+        android:layout_marginStart="@dimen/player_touch_lock_margin_start"
+        android:background="?attr/blblFocusBgRound"
+        android:contentDescription="@string/player_touch_lock"
+        android:focusable="false"
+        android:padding="@dimen/player_touch_lock_button_padding"
+        android:scaleType="fitCenter"
+        android:visibility="gone"
+        app:srcCompat="@drawable/ic_player_unlock"
+        app:tint="@color/player_button_tint" />
+</FrameLayout>

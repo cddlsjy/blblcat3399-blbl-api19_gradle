@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Player bottom OSD: baseline values (tuned at 1080p@1.5).
+      Runtime scaling is applied by code (userScale + autoScale).
+      Baseline tuning target: 1920x1080 with screen scale shown as 1.5x in "设备信息 -> 屏幕".
+    -->
+
+    <!-- Focus target size (all buttons) -->
+    <dimen name="player_osd_button_target_size">53.1dp</dimen>
+
+    <!-- Button spacing -->
+    <dimen name="player_osd_gap">2.7dp</dimen>
+
+    <!-- Icon padding: transport (prev/next/play) -->
+    <dimen name="player_osd_pad_transport">5.59dp</dimen>
+
+    <!-- Icon padding: normal buttons (subtitle/danmaku/up) -->
+    <dimen name="player_osd_pad_normal">6.59dp</dimen>
+
+    <!-- Icon padding: small buttons (like/coin/fav/advanced) -->
+    <dimen name="player_osd_pad_small">7.24dp</dimen>
+
+</resources>

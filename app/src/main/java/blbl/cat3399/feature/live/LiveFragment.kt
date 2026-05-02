@@ -1,0 +1,356 @@
+package blbl.cat3399.feature.live
+
+import android.os.Bundle
+import android.os.SystemClock
+import android.view.KeyEvent
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.fragment.app.Fragment
+import androidx.lifecycle.lifecycleScope
+import androidx.viewpager2.adapter.FragmentStateAdapter
+import blbl.cat3399.core.api.BiliApi
+import blbl.cat3399.core.log.AppLog
+import blbl.cat3399.core.model.LiveAreaParent
+import blbl.cat3399.core.net.BiliClient
+import blbl.cat3399.core.prefs.AppPrefs
+import blbl.cat3399.core.ui.TabContentFocusTarget
+import blbl.cat3399.core.ui.enableDpadTabFocus
+import blbl.cat3399.core.ui.findCurrentViewPagerChildFragment
+import blbl.cat3399.core.ui.findCurrentViewPagerChildFragmentAs
+import blbl.cat3399.core.ui.postDelayedIfAlive
+import blbl.cat3399.core.ui.postIfAlive
+import blbl.cat3399.core.ui.requestFocusSelectedTab
+import blbl.cat3399.databinding.FragmentLiveBinding
+import blbl.cat3399.ui.BackPressHandler
+import blbl.cat3399.ui.RefreshKeyHandler
+import blbl.cat3399.ui.SidebarFocusHost
+import com.google.android.material.tabs.TabLayout
+import com.google.android.material.tabs.TabLayoutMediator
+import androidx.fragment.app.FragmentManager
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+
+class LiveFragment : Fragment(), LiveGridTabSwitchFocusHost, BackPressHandler, LiveNavigator {
+    private var _binding: FragmentLiveBinding? = null
+    private val binding get() = _binding!!
+
+    private var mediator: TabLayoutMediator? = null
+    private var pageCallback: androidx.viewpager2.widget.ViewPager2.OnPageChangeCallback? = null
+    private var pendingFocusFirstCardFromContentSwitch: Boolean = false
+    private var pendingFocusFirstCardFromBackToTab0: Boolean = false
+    private var pendingBackToTab0RequestToken: Int = 0
+    private var pendingBackToTab0AttemptsLeft: Int = 0
+    private var pendingRestoreFocusAfterDetailReturn: Boolean = false
+
+    private var loadAreasJob: Job? = null
+    private var backStackListener: FragmentManager.OnBackStackChangedListener? = null
+
+    private val tabReselectRefreshListener: TabLayout.OnTabSelectedListener =
+        object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab) = Unit
+
+            override fun onTabUnselected(tab: TabLayout.Tab) = Unit
+
+            override fun onTabReselected(tab: TabLayout.Tab) {
+                refreshCurrentPageFromTabReselect()
+            }
+        }
+
+    private var tabs: List<LiveTab> =
+        buildList {
+            add(LiveTab.Recommend)
+            if (BiliClient.cookies.hasSessData()) add(LiveTab.Following)
+        }
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        _binding = FragmentLiveBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        setTabs(tabs)
+        backStackListener =
+            FragmentManager.OnBackStackChangedListener {
+                val showDetail = updateDetailVisibility()
+                if (!showDetail) maybeRestoreFocusAfterDetailReturn()
+            }.also { childFragmentManager.addOnBackStackChangedListener(it) }
+        updateDetailVisibility()
+
+        loadAreasJob?.cancel()
+        loadAreasJob =
+            viewLifecycleOwner.lifecycleScope.launch {
+                runCatching { BiliApi.liveAreas() }
+                    .onSuccess { parents -> applyAreas(parents) }
+                    .onFailure { AppLog.w("Live", "load areas failed", it) }
+            }
+    }
+
+    override fun onResume() {
+        super.onResume()
+    }
+
+    override fun openAreaDetail(parentAreaId: Int, parentTitle: String, areaId: Int, areaTitle: String): Boolean {
+        if (_binding == null || childFragmentManager.isStateSaved) return false
+        pendingRestoreFocusAfterDetailReturn = true
+        childFragmentManager.beginTransaction()
+            .setReorderingAllowed(true)
+            .replace(
+                binding.detailContainer.id,
+                LiveAreaDetailFragment.newInstance(
+                    parentAreaId = parentAreaId,
+                    parentTitle = parentTitle,
+                    areaId = areaId,
+                    areaTitle = areaTitle,
+                ),
+            )
+            .addToBackStack(null)
+            .commit()
+        updateDetailVisibility()
+        return true
+    }
+
+    private fun updateDetailVisibility(): Boolean {
+        val b = _binding ?: return false
+        val showDetail = childFragmentManager.backStackEntryCount > 0
+        b.detailContainer.visibility = if (showDetail) View.VISIBLE else View.GONE
+        b.tabLayout.visibility = if (showDetail) View.GONE else View.VISIBLE
+        b.viewPager.visibility = if (showDetail) View.GONE else View.VISIBLE
+        return showDetail
+    }
+
+    private fun maybeRestoreFocusAfterDetailReturn() {
+        if (!pendingRestoreFocusAfterDetailReturn) return
+        val b = _binding ?: return
+        pendingRestoreFocusAfterDetailReturn = false
+        val isUiAlive = { _binding === b && isResumed }
+        b.viewPager.postIfAlive(isAlive = isUiAlive) {
+            val page = currentPageFragment()
+            val restored = (page as? LivePageReturnFocusTarget)?.restoreFocusAfterReturnFromDetail() == true
+            if (!restored) {
+                focusCurrentPageFirstCardFromContentSwitch()
+            }
+        }
+    }
+
+    private fun currentPageFragment(): Fragment? {
+        return findCurrentViewPagerChildFragment(binding.viewPager)
+    }
+
+    private fun refreshCurrentPageFromTabReselect(): Boolean {
+        val page = currentPageFragment() ?: return false
+        val handler = page as? RefreshKeyHandler ?: return false
+        return handler.handleRefreshKey()
+    }
+
+    private fun applyAreas(parents: List<LiveAreaParent>) {
+        // Keep UI manageable: recommend + following + top parents.
+        val picked =
+            parents
+                .filter { it.id > 0 && it.name.isNotBlank() }
+                .sortedByDescending { it.children.count { c -> c.hot } }
+                .take(12)
+                .map { LiveTab.Area(parentId = it.id, title = it.name) }
+        val next = buildList {
+            add(LiveTab.Recommend)
+            if (BiliClient.cookies.hasSessData()) add(LiveTab.Following)
+            addAll(picked)
+        }
+        if (next == tabs) return
+        tabs = next
+        setTabs(tabs)
+    }
+
+    private fun setTabs(list: List<LiveTab>) {
+        if (_binding == null) return
+        mediator?.detach()
+        mediator = null
+
+        val b = binding
+        b.viewPager.adapter = LivePagerAdapter(this, list)
+        mediator =
+            TabLayoutMediator(b.tabLayout, b.viewPager) { tab, position ->
+                tab.text = list.getOrNull(position)?.title ?: ""
+            }.also { it.attach() }
+
+        b.tabLayout.removeOnTabSelectedListener(tabReselectRefreshListener)
+        b.tabLayout.addOnTabSelectedListener(tabReselectRefreshListener)
+
+        val tabLayout = b.tabLayout
+        tabLayout.postIfAlive(isAlive = { _binding === b }) {
+            tabLayout.enableDpadTabFocus(selectOnFocusProvider = { BiliClient.prefs.tabSwitchFollowsFocus }) { position ->
+                val title = list.getOrNull(position)?.title
+                AppLog.d("Live", "tab focus pos=$position title=$title t=${SystemClock.uptimeMillis()}")
+            }
+            val tabStrip = tabLayout.getChildAt(0) as? ViewGroup ?: return@postIfAlive
+            for (i in 0 until tabStrip.childCount) {
+                tabStrip.getChildAt(i).setOnKeyListener { _, keyCode, event ->
+                    if (event.action == KeyEvent.ACTION_DOWN && keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                        focusCurrentPageFirstCardFromTab()
+                        return@setOnKeyListener true
+                    }
+                    false
+                }
+            }
+        }
+
+        pageCallback?.let { binding.viewPager.unregisterOnPageChangeCallback(it) }
+        pageCallback =
+            object : androidx.viewpager2.widget.ViewPager2.OnPageChangeCallback() {
+                override fun onPageSelected(position: Int) {
+                    val tab = list.getOrNull(position)
+                    AppLog.d("Live", "page selected pos=$position title=${tab?.title} t=${SystemClock.uptimeMillis()}")
+                    if (pendingFocusFirstCardFromBackToTab0) {
+                        maybeRequestTab0FocusFromBackToTab0()
+                    } else if (pendingFocusFirstCardFromContentSwitch) {
+                        if (focusCurrentPageFirstCardFromContentSwitch()) {
+                            pendingFocusFirstCardFromContentSwitch = false
+                        }
+                    }
+                }
+            }.also { binding.viewPager.registerOnPageChangeCallback(it) }
+    }
+
+    private fun focusCurrentPageFirstCardFromTab(): Boolean {
+        val pageFragment = findCurrentViewPagerChildFragmentAs<TabContentFocusTarget>(binding.viewPager) ?: return false
+        return pageFragment.requestFocusPrimaryItemFromTab()
+    }
+
+    private fun focusCurrentPageFirstCardFromContentSwitch(): Boolean {
+        val pageFragment = findCurrentViewPagerChildFragmentAs<TabContentFocusTarget>(binding.viewPager) ?: return false
+        return pageFragment.requestFocusPrimaryItemFromContentSwitch()
+    }
+
+    private fun maybeRequestTab0FocusFromBackToTab0(): Boolean {
+        val b = _binding ?: return false
+        if (!pendingFocusFirstCardFromBackToTab0) return false
+        // "Back -> tab0 content" is only meaningful when tab0 is selected.
+        if (b.viewPager.currentItem != 0) return false
+
+        val tab0 = findCurrentViewPagerChildFragmentAs<TabContentFocusTarget>(b.viewPager)
+        if (tab0 != null) {
+            tab0.requestFocusPrimaryItemFromBackToTab0()
+            pendingFocusFirstCardFromBackToTab0 = false
+            pendingBackToTab0AttemptsLeft = 0
+            return true
+        }
+
+        // Page fragment not ready yet: retry for a few frames.
+        if (pendingBackToTab0AttemptsLeft <= 0) return false
+        val token = pendingBackToTab0RequestToken
+        pendingBackToTab0AttemptsLeft--
+        b.viewPager.postDelayedIfAlive(
+            delayMillis = 16L,
+            isAlive = { _binding === b && pendingFocusFirstCardFromBackToTab0 && pendingBackToTab0RequestToken == token },
+        ) {
+            maybeRequestTab0FocusFromBackToTab0()
+        }
+        return true
+    }
+
+    private fun focusSelectedTab(): Boolean {
+        val b = _binding ?: return false
+        return b.tabLayout.requestFocusSelectedTab(fallbackPosition = b.viewPager.currentItem) { _binding != null }
+    }
+
+    override fun requestFocusCurrentPageFirstCardFromContentSwitch(): Boolean {
+        pendingFocusFirstCardFromContentSwitch = true
+        if (focusCurrentPageFirstCardFromContentSwitch()) {
+            pendingFocusFirstCardFromContentSwitch = false
+        }
+        return true
+    }
+
+    override fun handleBackPressed(): Boolean {
+        if (childFragmentManager.popBackStackImmediate()) {
+            updateDetailVisibility()
+            maybeRestoreFocusAfterDetailReturn()
+            return true
+        }
+        val b = _binding ?: return false
+        val scheme = BiliClient.prefs.mainBackFocusScheme
+
+        // Tab strip is a navigation layer: Back should always return to the left sidebar.
+        if (b.tabLayout.hasFocus()) {
+            return (activity as? SidebarFocusHost)?.requestFocusSidebarSelectedNav() == true
+        }
+
+        // Only handle the Back key when focus is inside the page content area.
+        val inContent = b.viewPager.hasFocus() && !b.tabLayout.hasFocus()
+        if (!inContent) return false
+
+        return when (scheme) {
+            AppPrefs.MAIN_BACK_FOCUS_SCHEME_A -> focusSelectedTab()
+            AppPrefs.MAIN_BACK_FOCUS_SCHEME_B -> {
+                if (b.viewPager.currentItem != 0) {
+                    pendingFocusFirstCardFromBackToTab0 = true
+                    pendingFocusFirstCardFromContentSwitch = false
+                    pendingBackToTab0RequestToken++
+                    pendingBackToTab0AttemptsLeft = 30
+                    // Use non-smooth switch: smooth scrolling may trigger intermediate onPageSelected callbacks
+                    // and consume the pending focus restore on the wrong page.
+                    b.viewPager.setCurrentItem(0, false)
+                    true
+                } else {
+                    (activity as? SidebarFocusHost)?.requestFocusSidebarSelectedNav() == true
+                }
+            }
+            AppPrefs.MAIN_BACK_FOCUS_SCHEME_C -> {
+                (activity as? SidebarFocusHost)?.requestFocusSidebarSelectedNav() == true
+            }
+            else -> focusSelectedTab()
+        }
+    }
+
+    override fun onDestroyView() {
+        loadAreasJob?.cancel()
+        loadAreasJob = null
+
+        backStackListener?.let { childFragmentManager.removeOnBackStackChangedListener(it) }
+        backStackListener = null
+
+        mediator?.detach()
+        mediator = null
+
+        pageCallback?.let { binding.viewPager.unregisterOnPageChangeCallback(it) }
+        pageCallback = null
+
+        _binding = null
+        super.onDestroyView()
+    }
+
+    data class LiveTab(
+        val title: String,
+        val kind: Kind,
+        val parentId: Int?,
+    ) {
+        enum class Kind { RECOMMEND, FOLLOWING, AREA }
+
+        companion object {
+            val Recommend = LiveTab(title = "推荐", kind = Kind.RECOMMEND, parentId = null)
+            val Following = LiveTab(title = "关注", kind = Kind.FOLLOWING, parentId = null)
+            fun Area(parentId: Int, title: String) = LiveTab(title = title, kind = Kind.AREA, parentId = parentId)
+        }
+    }
+
+    private class LivePagerAdapter(
+        fragment: Fragment,
+        private val tabs: List<LiveTab>,
+    ) : FragmentStateAdapter(fragment) {
+        override fun getItemCount(): Int = tabs.size
+
+        override fun createFragment(position: Int): Fragment {
+            val tab = tabs[position]
+            AppLog.d("Live", "createFragment pos=$position title=${tab.title} kind=${tab.kind} pid=${tab.parentId} t=${SystemClock.uptimeMillis()}")
+            return when (tab.kind) {
+                LiveTab.Kind.RECOMMEND -> LiveGridFragment.newRecommend()
+                LiveTab.Kind.FOLLOWING -> LiveGridFragment.newFollowing()
+                LiveTab.Kind.AREA -> LiveAreaIndexFragment.newInstance(parentAreaId = tab.parentId ?: 0, parentTitle = tab.title)
+            }
+        }
+    }
+
+    companion object {
+        fun newInstance() = LiveFragment()
+    }
+}
